@@ -22,22 +22,37 @@ df = pd.read_csv("raw_transactions.csv", parse_dates=["transaction_date", "signu
 
 print("Raw rows:", len(df))
 
-# 1. Drop exact duplicate transaction rows
+# 1. Drop exact duplicate transaction rows.
+#    In a real pipeline these usually come from double-fired webhooks or
+#    re-processed batch jobs. Leaving them in would double-count revenue
+#    and inflate both retention counts and CLTV.
 df = df.drop_duplicates()
 
-# 2. Drop rows with missing user_id (can't attribute the transaction to a cohort)
+# 2. Drop rows with missing user_id.
+#    A transaction we can't tie to a user is useless for cohort analysis —
+#    we have no way to know which acquisition month it belongs to, so we
+#    can't safely impute it either. Safer to drop than guess.
 df = df.dropna(subset=["user_id"])
 
-# 3. Filter out refunded/failed transactions — they don't represent real revenue
+# 3. Filter out refunded/failed transactions.
+#    Refunds represent revenue that was reversed — including them would
+#    overstate both the CLTV and the apparent purchase frequency of users
+#    who later got refunded.
 df = df[df["status"] == "completed"].copy()
 
 print("Cleaned rows:", len(df))
 
-# 4. Calculate "Cohort Month" = month of each user's first transaction
+# 4. Calculate "Cohort Month" = the month of each user's FIRST transaction.
+#    This is the anchor date every other calculation is relative to —
+#    it's what lets us ask "how many months after joining did this user
+#    still purchase?" instead of just looking at raw calendar months.
 df["transaction_month"] = df["transaction_date"].dt.to_period("M")
 df["cohort_month"] = df.groupby("user_id")["transaction_month"].transform("min")
 
-# 5. Cohort index = number of months between transaction and cohort month
+# 5. Cohort index = number of months between a transaction and the user's
+#    cohort month. Month 0 = the signup/first-purchase month itself,
+#    Month 1 = one month later, etc. This is the x-axis of the retention
+#    matrix built in Week 2.
 def month_diff(row):
     return (row["transaction_month"].year - row["cohort_month"].year) * 12 + \
            (row["transaction_month"].month - row["cohort_month"].month)
@@ -49,21 +64,33 @@ df.to_csv("clean_transactions.csv", index=False)
 # ----------------------------------------------------------------------
 # WEEK 2: COHORT RETENTION MATRIX
 # ----------------------------------------------------------------------
+# Count how many DISTINCT users from each cohort_month are still
+# transacting at each cohort_index (0, 1, 2, ... months later).
 cohort_data = df.groupby(["cohort_month", "cohort_index"])["user_id"].nunique().reset_index()
+
+# Pivot into a matrix: rows = cohort month, columns = months since acquisition,
+# values = number of users still active. This is the "raw counts" version.
 cohort_pivot = cohort_data.pivot(index="cohort_month", columns="cohort_index", values="user_id")
 
+# Convert counts into percentages relative to each cohort's own Month 0 size.
+# This is what makes cohorts of very different sizes comparable — e.g. a
+# cohort of 50 users and a cohort of 500 users can both be read as "% retained".
 cohort_sizes = cohort_pivot.iloc[:, 0]
 retention_matrix = cohort_pivot.divide(cohort_sizes, axis=0) * 100
 
 retention_matrix.to_csv("retention_matrix_pct.csv")
 cohort_pivot.to_csv("retention_matrix_counts.csv")
 
-# Average retention decay curve across all cohorts (Month 0 - Month 6)
+# Average retention decay curve across all cohorts (Month 0 - Month 6).
+# Averaging smooths out noise from any single cohort and shows the
+# "typical" churn curve, which is what the Week 4 decay chart plots.
 avg_retention = retention_matrix.iloc[:, 0:7].mean(axis=0)
 
 # ----------------------------------------------------------------------
 # WEEK 3: CLTV CALCULATION
 # ----------------------------------------------------------------------
+# Collapse the transaction-level data down to one row per user with the
+# aggregates we need for a lifetime-value estimate.
 user_revenue = df.groupby("user_id").agg(
     total_revenue=("amount", "sum"),
     n_purchases=("amount", "count"),
@@ -73,15 +100,26 @@ user_revenue = df.groupby("user_id").agg(
     active_months=("cohort_index", "max"),
 ).reset_index()
 
+# Average Order Value: how much does this user spend per purchase, on average?
 user_revenue["aov"] = user_revenue["total_revenue"] / user_revenue["n_purchases"]
-user_revenue["active_months"] = user_revenue["active_months"] + 1  # inclusive of month 0
+
+# +1 because cohort_index is zero-based (Month 0 counts as "1 active month").
+user_revenue["active_months"] = user_revenue["active_months"] + 1
+
+# How many purchases does this user make per active month, on average?
 user_revenue["purchase_freq_per_month"] = user_revenue["n_purchases"] / user_revenue["active_months"]
 
-# Historical CLTV (observed, 12-month capped) = AOV x monthly purchase freq x 12 months
+# Historical CLTV projection: if this user keeps buying at their observed
+# AOV and frequency for a full 12 months, what's their total value?
+# This is a simple historical-run-rate model (not a probabilistic/BG-NBD
+# model) — appropriate for an MVP, but worth noting as a limitation if this
+# were a production system, since it assumes past behavior continues linearly.
 user_revenue["cltv_12mo"] = (
     user_revenue["aov"] * user_revenue["purchase_freq_per_month"] * 12
 )
 
+# Segment CLTV by channel and region so the Finance Director can compare
+# "value of a customer" against "cost to acquire a customer" (CAC) per segment.
 cltv_by_channel = user_revenue.groupby("acquisition_channel")["cltv_12mo"].agg(
     ["mean", "median", "count"]
 ).sort_values("mean", ascending=False)
@@ -98,7 +136,10 @@ cltv_by_region.to_csv("cltv_by_region.csv")
 # WEEK 4: VISUALIZATION
 # ----------------------------------------------------------------------
 
-# --- Heatmap ---
+# --- Heatmap: the core "at-a-glance" deliverable for the Product Manager ---
+# Darker/higher values = more retained users. Reading down a column shows
+# whether retention at a given month-since-acquisition is improving or
+# worsening across newer cohorts (a sign of product changes taking effect).
 fig, ax = plt.subplots(figsize=(13, 8))
 heatmap_data = retention_matrix.iloc[:, 0:9]  # Month 0 to Month 8
 heatmap_data.index = heatmap_data.index.astype(str)
@@ -113,7 +154,9 @@ plt.tight_layout()
 plt.savefig("retention_heatmap.png", dpi=150)
 plt.close()
 
-# --- Decay curve ---
+# --- Decay curve: the "single number" summary of the heatmap ---
+# Useful for exec reporting where a full heatmap is too dense — this answers
+# "on average, how much of a cohort do we still have after N months?"
 fig, ax = plt.subplots(figsize=(9, 6))
 ax.plot(avg_retention.index, avg_retention.values, marker="o", linewidth=2, color="#2b6cb0")
 ax.set_title("Average Retention Decay Curve (All Cohorts)", fontsize=14, fontweight="bold")
@@ -126,7 +169,7 @@ plt.tight_layout()
 plt.savefig("retention_decay_curve.png", dpi=150)
 plt.close()
 
-# --- CLTV by channel bar chart ---
+# --- CLTV by channel bar chart: for the Finance Director's CAC comparison ---
 fig, ax = plt.subplots(figsize=(9, 6))
 cltv_by_channel["mean"].sort_values().plot(kind="barh", ax=ax, color="#38a169")
 ax.set_title("Average 12-Month CLTV by Acquisition Channel", fontsize=14, fontweight="bold")
