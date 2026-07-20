@@ -54,17 +54,49 @@ CLTV-by-channel bar chart (see `.png` files in this repo).
   more likely to become long-term, high-value customers — a natural point for a
   loyalty or upsell campaign.
 
+## Challenges Faced
+
+- **Handling messy real-world-style data.** The synthetic dataset intentionally
+  includes duplicate rows and missing `user_id` values (mimicking double-fired
+  tracking pixels and broken joins). Getting the cleaning order right mattered —
+  dropping duplicates *before* deriving `cohort_month` avoids inflating any single
+  user's transaction count, which would otherwise skew both retention and CLTV.
+
+- **Choosing a CLTV formula appropriate for an MVP.** A full probabilistic CLTV
+  model (e.g., BG/NBD + Gamma-Gamma) was out of scope for a 4-week roadmap, so a
+  simpler historical run-rate model (`AOV × monthly purchase frequency × 12`) was
+  used instead. This is a reasonable approximation for users with enough purchase
+  history, but it's worth noting as a real limitation: it assumes recent behavior
+  continues linearly, which will overstate CLTV for users who are actually about
+  to churn.
+
+- **Deciding what "retention" means at Month 0.** Every cohort is 100% retained
+  at Month 0 by definition (it's their first purchase month), which can make the
+  heatmap look artificially strong on the left edge. The decay curve chart was
+  added specifically to make the *shape* of the drop-off after Month 0 easier to
+  read than the heatmap alone.
+
+- **Keeping the analysis reproducible without committing data.** Since raw
+  `.csv` files can't be pushed to GitHub, the whole pipeline had to be
+  script-driven and deterministic (`np.random.seed(42)` in `generate_data.py`)
+  so that anyone re-running it gets the same numbers referenced in this README.
+
 ## Files
 | File | Description |
 |---|---|
 | `generate_data.py` | Generates the synthetic raw transaction log |
 | `cohort_analysis.py` | Full cleaning → cohort matrix → CLTV → visualization pipeline |
+| `segment_channel_region.py` | Combined channel × region CLTV segmentation (deeper dive beyond single-dimension segments) |
+| `week1_eda.ipynb` | Jupyter notebook version of the Week 1 exploratory data analysis |
+| `requirements.txt` | Python dependencies needed to run the scripts |
 | `retention_matrix_pct.csv` | Cohort retention % matrix |
 | `user_cltv.csv` | Per-user CLTV, AOV, purchase frequency |
 | `cltv_by_channel.csv`, `cltv_by_region.csv` | CLTV segmented by channel/region |
+| `cltv_by_channel_and_region.csv` | CLTV segmented by channel AND region combined |
 | `retention_heatmap.png` | Cohort retention heatmap |
 | `retention_decay_curve.png` | Average retention decay curve |
 | `cltv_by_channel.png` | CLTV by acquisition channel |
+| `cltv_channel_region_heatmap.png` | CLTV by channel × region combined |
 
 ## Suggested `.gitignore`
 ```
