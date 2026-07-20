@@ -53,11 +53,13 @@ df["cohort_month"] = df.groupby("user_id")["transaction_month"].transform("min")
 #    cohort month. Month 0 = the signup/first-purchase month itself,
 #    Month 1 = one month later, etc. This is the x-axis of the retention
 #    matrix built in Week 2.
-def month_diff(row):
-    return (row["transaction_month"].year - row["cohort_month"].year) * 12 + \
-           (row["transaction_month"].month - row["cohort_month"].month)
-
-df["cohort_index"] = df.apply(month_diff, axis=1)
+#    NOTE: computed as a vectorized operation on the Period columns rather
+#    than a row-wise .apply() — this scales much better as the transaction
+#    log grows, since .apply() effectively loops over every row in Python.
+df["cohort_index"] = (
+    (df["transaction_month"].dt.year - df["cohort_month"].dt.year) * 12
+    + (df["transaction_month"].dt.month - df["cohort_month"].dt.month)
+)
 
 df.to_csv("clean_transactions.csv", index=False)
 
